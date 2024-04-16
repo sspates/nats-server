@@ -334,18 +334,10 @@ func TestJetStreamJWTMove(t *testing.T) {
 		js, err := nc.JetStream()
 		require_NoError(t, err)
 
-		var ci *nats.StreamInfo
-		checkFor(t, 3*time.Second, 500*time.Millisecond, func() error {
-			_ci, err := js.AddStream(&nats.StreamConfig{Name: "MOVE-ME", Replicas: replicas,
-				Placement: &nats.Placement{Tags: []string{"cloud:C1-tag"}}})
-			if err == nil {
-				require_Equal(t, _ci.Cluster.Name, "C1")
-				ci = _ci
-			} else {
-				t.Logf("Error: %s", err)
-			}
-			return err
-		})
+		ci, err := js.AddStream(&nats.StreamConfig{Name: "MOVE-ME", Replicas: replicas,
+			Placement: &nats.Placement{Tags: []string{"cloud:C1-tag"}}})
+		require_NoError(t, err)
+		require_Equal(t, ci.Cluster.Name, "C1")
 
 		_, err = js.AddConsumer("MOVE-ME", &nats.ConsumerConfig{Durable: "dur", AckPolicy: nats.AckExplicitPolicy})
 		require_NoError(t, err)
