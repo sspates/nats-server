@@ -27,6 +27,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/antithesishq/antithesis-sdk-go/assert"
+	"github.com/antithesishq/antithesis-sdk-go/lifecycle"
 	jwt "github.com/nats-io/jwt/v2"
 	"github.com/nats-io/nats.go"
 	"github.com/nats-io/nkeys"
@@ -282,6 +284,8 @@ func TestJetStreamJWTMove(t *testing.T) {
 
 	accKp, aExpPub := createKey(t)
 
+	lifecycle.SetupComplete("TestJetStreamJWTMove")
+
 	test := func(t *testing.T, replicas int, accClaim *jwt.AccountClaims) {
 		accClaim.Name = "acc"
 		accJwt := encodeClaim(t, accClaim, aExpPub)
@@ -409,6 +413,8 @@ func TestJetStreamJWTMove(t *testing.T) {
 			test(t, 1, accClaim)
 		})
 	})
+
+	assert.Always(true, "Test completes without issues", nil)
 }
 
 func TestJetStreamJWTClusteredTiers(t *testing.T) {
