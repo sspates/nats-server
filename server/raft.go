@@ -31,6 +31,7 @@ import (
 	"sync/atomic"
 	"time"
 
+	"github.com/antithesishq/antithesis-sdk-go/assert"
 	"github.com/nats-io/nats-server/v2/internal/fastrand"
 
 	"github.com/minio/highwayhash"
@@ -159,6 +160,7 @@ type raft struct {
 	pindex   uint64 // Previous index from the last snapshot
 	commit   uint64 // Sequence number of the most recent commit
 	applied  uint64 // Sequence number of the most recently applied commit
+	trimmed  uint64 // Where did we compact up to in the log?
 	hcbehind bool   // Were we falling behind at the last health check? (see: isCurrent)
 
 	leader string // The ID of the leader
@@ -1065,6 +1067,9 @@ func (n *raft) InstallSnapshot(data []byte) error {
 		n.Unlock()
 		return err
 	}
+
+	// This is where we compacted up to.
+	n.trimmed = snap.lastIndex + 1
 	n.Unlock()
 
 	psnaps, _ := os.ReadDir(snapDir)
@@ -1840,18 +1845,18 @@ func (n *raft) run() {
 
 func (n *raft) debug(format string, args ...any) {
 	if n.dflag {
-		nf := fmt.Sprintf("RAFT [%s - %s] %s", n.id, n.group, format)
+		nf := fmt.Sprintf("RAFT [%s - %s - %d/%d/%d/%d] %s", n.id, n.group, n.term, n.pindex, n.commit, n.applied, format)
 		n.s.Debugf(nf, args...)
 	}
 }
 
 func (n *raft) warn(format string, args ...any) {
-	nf := fmt.Sprintf("RAFT [%s - %s] %s", n.id, n.group, format)
+	nf := fmt.Sprintf("RAFT [%s - %s- %d/%d/%d/%d] %s", n.id, n.group, n.term, n.pindex, n.commit, n.applied, format)
 	n.s.RateLimitWarnf(nf, args...)
 }
 
 func (n *raft) error(format string, args ...any) {
-	nf := fmt.Sprintf("RAFT [%s - %s] %s", n.id, n.group, format)
+	nf := fmt.Sprintf("RAFT [%s - %s- %d/%d/%d/%d] %s", n.id, n.group, n.term, n.pindex, n.commit, n.applied, format)
 	n.s.Errorf(nf, args...)
 }
 
@@ -2682,14 +2687,10 @@ func (n *raft) applyCommit(index uint64) error {
 		n.debug("Ignoring apply commit for %d, already processed", index)
 		return nil
 	}
-	original := n.commit
-	n.commit = index
 
 	if n.State() == Leader {
 		delete(n.acks, index)
 	}
-
-	var fpae bool
 
 	ae := n.pae[index]
 	if ae == nil {
@@ -2708,15 +2709,16 @@ func (n *raft) applyCommit(index uint64) error {
 				// Reset and cancel any catchup.
 				n.resetWAL()
 				n.cancelCatchup()
-			} else {
-				n.commit = original
 			}
 			return errEntryLoadFailed
 		}
 	} else {
-		fpae = true
+		// Make sure to clean up the pending append entry from
+		// memory when we're done.
+		defer delete(n.pae, index)
 	}
 
+	n.commit = index
 	ae.buf = nil
 
 	var committed []*Entry
@@ -2791,9 +2793,7 @@ func (n *raft) applyCommit(index uint64) error {
 			committed = append(committed, e)
 		}
 	}
-	if fpae {
-		delete(n.pae, index)
-	}
+
 	// Pass to the upper layers if we have normal entries. It is
 	// entirely possible that 'committed' might be an empty slice here,
 	// which will happen if we've processed updates inline (like peer
@@ -2842,6 +2842,7 @@ func (n *raft) trackResponse(ar *appendEntryResponse) {
 					break
 				}
 			}
+			n.debug("Leader has finished committing entries")
 			sendHB = n.prop.len() == 0
 		}
 	}
@@ -2948,6 +2949,7 @@ func (n *raft) runAsCandidate() {
 				if n.wonElection(len(votes)) {
 					// Become LEADER if we have won and gotten a quorum with everyone we should hear from.
 					n.switchToLeader()
+					n.debug("Won election, voted by: %+v", votes)
 					return
 				}
 			} else if vresp.term > nterm {
@@ -3069,7 +3071,7 @@ func (n *raft) truncateWAL(term, index uint64) {
 	if err := n.wal.Truncate(index); err != nil {
 		// If we get an invalid sequence, reset our wal all together.
 		if err == ErrInvalidSequence {
-			n.debug("Resetting WAL")
+			n.debug("Resetting WAL due to invalid sequence error from filestore")
 			n.wal.Truncate(0)
 			index, n.term, n.pterm, n.pindex = 0, 0, 0, 0
 		} else {
@@ -3209,6 +3211,15 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 		}
 	}
 
+	// SPEC: 1. Reply false if term < currentTerm (§5.1)
+	if ae.term < n.term {
+		ar := newAppendEntryResponse(ae.pterm, ae.pindex, n.id, false)
+		n.Unlock()
+		n.sendRPC(ae.reply, _EMPTY_, ar.encode(arbuf))
+		arPool.Put(ar)
+		return
+	}
+
 	// If this term is greater than ours.
 	if ae.term > n.term {
 		n.pterm = ae.pterm
@@ -3232,54 +3243,83 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 	}
 
 	if (isNew && ae.pterm != n.pterm) || ae.pindex != n.pindex {
+		// Cancel regardless.
+		n.cancelCatchup()
+
 		// Check if this is a lower or equal index than what we were expecting.
 		if ae.pindex <= n.pindex {
 			n.debug("AppendEntry detected pindex less than ours: %d:%d vs %d:%d", ae.pterm, ae.pindex, n.pterm, n.pindex)
 			var ar *appendEntryResponse
 
-			var success bool
+			// var success bool
+			// Possible outcomes:
+			// 1. loadEntry will return nil because the entry was never committed
+			// 2. loadEntry will return nil because it *was* committed but then a snapshot
+			// 3. loadEntry doesn't return nil, so check index/term
+			//
+			// SPEC: 2. Reply false if log doesn’t contain an entry at prevLogIndex
+			//    whose term matches prevLogTerm (§5.3)
 			if eae, _ := n.loadEntry(ae.pindex); eae == nil {
+				if n.trimmed >= ae.pindex {
+					// Might be nil because it was applied, check if so.
+					n.warn("Received AppendEntry with pindex %d less than trimmed %d", ae.pindex, n.trimmed)
+					//return
+				} else {
+					n.warn("Received AppendEntry with pindex %d that we haven't heard of", ae.pindex)
+					// Might be nil because we never heard about it.
+					ar = newAppendEntryResponse(ae.pterm, ae.pindex, n.id, false)
+					n.Unlock()
+					n.sendRPC(ae.reply, _EMPTY_, ar.encode(arbuf))
+					arPool.Put(ar)
+					//return
+				}
+
 				// If terms are equal, and we are not catching up, we have simply already processed this message.
 				// So we will ACK back to the leader. This can happen on server restarts based on timings of snapshots.
+
 				if ae.pterm == n.pterm && !catchingUp {
-					success = true
+					//success = true
 				} else {
-					n.resetWAL()
+					assert.Unreachable("Shouldn't have different pterms", map[string]any{
+						"ae.pterm":   ae.pterm,
+						"n.pterm":    n.pterm,
+						"catchingUp": catchingUp,
+					})
 				}
-			} else {
+				return
+			} else if eae.pterm != ae.pterm {
 				// If terms mismatched, or we got an error loading, delete that entry and all others past it.
 				// Make sure to cancel any catchups in progress.
 				// Truncate will reset our pterm and pindex. Only do so if we have an entry.
 				n.truncateWAL(ae.pterm, ae.pindex)
 			}
-			// Cancel regardless.
-			n.cancelCatchup()
 
 			// Create response.
-			ar = newAppendEntryResponse(ae.pterm, ae.pindex, n.id, success)
+			/*ar = newAppendEntryResponse(ae.pterm, ae.pindex, n.id, success)
 			n.Unlock()
 			n.sendRPC(ae.reply, _EMPTY_, ar.encode(arbuf))
 			arPool.Put(ar)
-			return
+			return*/
 		}
 
 		// Check if we are catching up. If we are here we know the leader did not have all of the entries
 		// so make sure this is a snapshot entry. If it is not start the catchup process again since it
 		// means we may have missed additional messages.
 		if catchingUp {
+			// This means we already entered into a catchup state but what the leader sent us did not match what we expected.
+			// Snapshots and peerstate will always be together when a leader is catching us up in this fashion.
+			if len(ae.entries) != 2 || ae.entries[0].Type != EntrySnapshot || ae.entries[1].Type != EntryPeerState {
+				n.warn("Expected first catchup entry to be a snapshot and peerstate, will retry")
+				n.cancelCatchup()
+				n.Unlock()
+				return
+			}
+
 			// Check if only our terms do not match here.
 			if ae.pindex == n.pindex {
 				// Make sure pterms match and we take on the leader's.
 				// This prevents constant spinning.
 				n.truncateWAL(ae.pterm, ae.pindex)
-				n.cancelCatchup()
-				n.Unlock()
-				return
-			}
-			// This means we already entered into a catchup state but what the leader sent us did not match what we expected.
-			// Snapshots and peerstate will always be together when a leader is catching us up in this fashion.
-			if len(ae.entries) != 2 || ae.entries[0].Type != EntrySnapshot || ae.entries[1].Type != EntryPeerState {
-				n.warn("Expected first catchup entry to be a snapshot and peerstate, will retry")
 				n.cancelCatchup()
 				n.Unlock()
 				return
@@ -3315,6 +3355,7 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 			n.debug("AppendEntry did not match %d %d with %d %d", ae.pterm, ae.pindex, n.pterm, n.pindex)
 			// Reset our term.
 			n.term = n.pterm
+			// We know there's a gap, start a catchup and stop processing.
 			if ae.pindex > n.pindex {
 				// Setup our state for catching up.
 				inbox := n.createCatchup(ae)
@@ -3403,6 +3444,7 @@ func (n *raft) processAppendEntry(ae *appendEntry, sub *subscription) {
 					break
 				}
 			}
+			n.debug("Follower has finished committing entries")
 		}
 	}
 
