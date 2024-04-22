@@ -3875,6 +3875,20 @@ func (n *raft) processVoteRequest(vr *voteRequest) error {
 	}
 
 	n.Lock()
+
+	if n.leader != "" {
+		// A node that comes up after state reset or being in its own network partition
+		// for a long time might come back with a very high term number but potentially
+		// be behind in the log. The Raft paper addresses this in section 6 by suggesting
+		// that we should ignore vote requests if we think there's a valid leader still
+		// around so that it doesn't get forced to step down in that case.
+		if ps, ok := n.peers[n.leader]; ok && time.Since(time.Unix(0, ps.ts)) < minElectionTimeout {
+			// If we've heard from our leader recently then we should ignore a vote request.
+			n.Unlock()
+			return nil
+		}
+	}
+
 	n.resetElectionTimeout()
 
 	vresp := &voteResponse{n.term, n.id, false}

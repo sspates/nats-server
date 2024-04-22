@@ -256,7 +256,7 @@ func TestNRGSimpleElection(t *testing.T) {
 	require_NoError(t, rg.leader().node().StepDown())
 
 	// Wait for a vote request to come in.
-	msg := require_ChanRead(t, voteReqs, time.Second)
+	msg := require_ChanRead(t, voteReqs, time.Second*3)
 	vr := decodeVoteRequest(msg.Data, msg.Reply)
 	require_True(t, vr != nil)
 	require_NotEqual(t, vr.candidate, "")
