@@ -545,6 +545,13 @@ func (fs *fileStore) unlockAllMsgBlocks() {
 }
 
 func (fs *fileStore) UpdateConfig(cfg *StreamConfig) error {
+	start := time.Now()
+	defer func() {
+		if took := time.Since(start); took > time.Minute {
+			fs.warn("UpdateConfig took %v", took.Round(time.Millisecond))
+		}
+	}()
+
 	if fs.isClosed() {
 		return ErrStoreClosed
 	}
@@ -3649,6 +3656,13 @@ func (fs *fileStore) enforceBytesLimit() {
 // will most likely only be the last one, so can take a more conservative approach.
 // Lock should be held.
 func (fs *fileStore) enforceMsgPerSubjectLimit(fireCallback bool) {
+	start := time.Now()
+	defer func() {
+		if took := time.Since(start); took > time.Minute {
+			fs.debug("enforceMsgPerSubjectLimit took %v", took.Round(time.Millisecond))
+		}
+	}()
+
 	maxMsgsPer := uint64(fs.cfg.MaxMsgsPer)
 
 	// We may want to suppress callbacks from remove during this process
@@ -7625,6 +7639,7 @@ func (fs *fileStore) forceWriteFullState() error {
 // 3. MBs - Index, Bytes, First and Last Sequence and Timestamps, and the deleted map (avl.seqset).
 // 4. Last block index and hash of record inclusive to this stream state.
 func (fs *fileStore) _writeFullState(force bool) error {
+	start := time.Now()
 	fs.mu.Lock()
 	if fs.closed || fs.dirty == 0 {
 		fs.mu.Unlock()
@@ -7765,6 +7780,12 @@ func (fs *fileStore) _writeFullState(force bool) error {
 	}
 
 	fn := filepath.Join(fs.fcfg.StoreDir, msgDir, streamStreamStateFile)
+
+	defer func() {
+		if took := time.Since(start); took > time.Minute {
+			fs.warn("WriteFullState took %v (%d bytes)", took.Round(time.Millisecond), len(buf))
+		}
+	}()
 
 	fs.hh.Reset()
 	fs.hh.Write(buf)
